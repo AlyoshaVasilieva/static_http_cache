@@ -1,6 +1,6 @@
 [package]
 name = "static-http-cache"
-version = "0.2.0" # remember to update html_root_url
+version = "0.3.0" # remember to update html_root_url
 authors = ["Tim Allen <screwtape@froup.com>"]
 description = "A local cache for static HTTP resources"
 license = "MIT"
@@ -8,14 +8,16 @@ repository = "https://gitlab.com/Screwtapello/static_http_cache"
 readme = "README.md"
 keywords = ["http", "cache"]
 categories = ["caching", "network-programming", "web-programming::http-client"]
+edition = "2018"
 
 [dependencies]
-crypto-hash = "0.3.0"
 log = "0.4.1"
-reqwest = "0.9.9"
-sqlite = "0.23.9"
-rand = "0.4.2"
+reqwest = { version = "0.11", default-features = false, features = ["blocking"] }
+sqlite = "0.26"
+rand = "0.8"
+thiserror = "1.0"
+http = "0.2.4"
 
 [dev-dependencies]
 tempdir = "0.3.5"
-env_logger = "0.5.3"
+env_logger = "0.8.4"

@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://docs.rs/static_http_cache/0.2.0")]
+#![doc(html_root_url = "https://docs.rs/static_http_cache/0.3.0")]
 //! Introduction
 //! ============
 //!
@@ -42,13 +42,13 @@
 //!     use std::fs::File;
 //!     use std::path::PathBuf;
 //!
-//!     fn get_my_resource() -> Result<File, Box<Error>> {
+//!     fn get_my_resource() -> Result<File, Box<dyn Error>> {
 //!         let mut cache = static_http_cache::Cache::new(
 //!             PathBuf::from("my_cache_directory"),
-//!             reqwest::Client::new(),
+//!             reqwest::blocking::Client::new(),
 //!         )?;
 //!
-//!         cache.get(reqwest::Url::parse("http://example.com/some-resource")?)
+//!         Ok(cache.get(reqwest::Url::parse("http://example.com/some-resource")?)?)
 //!     }
 //!
 //! For repeated queries in the same program,
@@ -95,34 +95,42 @@
 //! is likely to stall other cache reads or writes
 //! until it's complete.
 
-extern crate crypto_hash;
 #[macro_use]
 extern crate log;
-extern crate rand;
-extern crate reqwest;
-extern crate sqlite;
 
-use std::error;
 use std::fs;
 use std::io;
+use std::iter;
 use std::path;
 
+use rand::distributions::Alphanumeric;
+use rand::Rng;
+use reqwest::blocking::Request;
 use reqwest::header as rh;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::StatusCode;
+
+use reqwest_mock::HttpResponse;
+
+pub use crate::error::Error;
 
 pub mod reqwest_mock;
 
 mod db;
+mod error;
 
 fn make_random_file<P: AsRef<path::Path>>(
     parent: P,
-) -> Result<(fs::File, path::PathBuf), Box<error::Error>> {
-    use rand::Rng;
+) -> Result<(fs::File, path::PathBuf), Error> {
     let mut rng = rand::thread_rng();
 
     loop {
-        let new_path = parent
-            .as_ref()
-            .join(rng.gen_ascii_chars().take(20).collect::<String>());
+        let filename: String = iter::repeat(())
+            .map(|_| rng.sample(Alphanumeric))
+            .map(char::from)
+            .take(20)
+            .collect();
+        let new_path = parent.as_ref().join(filename);
 
         match fs::OpenOptions::new()
             .create_new(true)
@@ -143,10 +151,7 @@ fn make_random_file<P: AsRef<path::Path>>(
     }
 }
 
-fn header_as_string(
-    headers: &rh::HeaderMap,
-    key: &rh::HeaderName,
-) -> Option<String> {
+fn header_as_string(headers: &HeaderMap, key: &HeaderName) -> Option<String> {
     headers.get(key).and_then(|value| match value.to_str() {
         Ok(s) => Some(s.into()),
         Err(err) => {
@@ -203,7 +208,7 @@ impl<C: reqwest_mock::Client> Cache<C> {
     ///     # fn get_my_resource() -> Result<(), Box<Error>> {
     ///     let mut cache = static_http_cache::Cache::new(
     ///         PathBuf::from("my_cache_directory"),
-    ///         reqwest::Client::new(),
+    ///         reqwest::blocking::Client::new(),
     ///     )?;
     ///     # Ok(())
     ///     # }
@@ -222,10 +227,7 @@ impl<C: reqwest_mock::Client> Cache<C> {
     /// In all cases, it should be safe to blow away the entire directory
     /// and start from scratch.
     /// It's only cached data, after all.
-    pub fn new(
-        root: path::PathBuf,
-        client: C,
-    ) -> Result<Cache<C>, Box<error::Error>> {
+    pub fn new(root: path::PathBuf, client: C) -> Result<Cache<C>, Error> {
         fs::DirBuilder::new().recursive(true).create(&root)?;
 
         let db = db::CacheDB::new(root.join("cache.db"))?;
@@ -237,10 +239,7 @@ impl<C: reqwest_mock::Client> Cache<C> {
         &mut self,
         url: reqwest::Url,
         response: &C::Response,
-    ) -> Result<(fs::File, path::PathBuf, db::Transaction), Box<error::Error>>
-    {
-        use reqwest_mock::HttpResponse;
-
+    ) -> Result<(fs::File, path::PathBuf, db::Transaction), Error> {
         let content_dir = self.root.join("content");
         fs::DirBuilder::new().recursive(true).create(&content_dir)?;
 
@@ -297,7 +296,7 @@ impl<C: reqwest_mock::Client> Cache<C> {
     ///     # fn get_my_resource() -> Result<(), Box<Error>> {
     ///     # let mut cache = static_http_cache::Cache::new(
     ///     #     PathBuf::from("my_cache_directory"),
-    ///     #     reqwest::Client::new(),
+    ///     #     reqwest::blocking::Client::new(),
     ///     # )?;
     ///     let file = cache.get(reqwest::Url::parse("http://example.com/some-resource")?)?;
     ///     # Ok(())
@@ -320,13 +319,18 @@ impl<C: reqwest_mock::Client> Cache<C> {
     /// the on-disk storage *should* be OK,
     /// so you might want to destroy this `Cache` instance
     /// and create a new one pointing at the same location.
-    pub fn get(
+    pub fn get(&mut self, url: reqwest::Url) -> Result<fs::File, Error> {
+        self.get_with_additional_headers(url, &[])
+    }
+
+    /// The same as [`get`](Self::get()) but allows adding additional headers, such as Referer.
+    ///
+    /// Attempting to set caching-related headers such as `If-None-Match` will return an error.
+    pub fn get_with_additional_headers(
         &mut self,
         mut url: reqwest::Url,
-    ) -> Result<fs::File, Box<error::Error>> {
-        use reqwest::StatusCode;
-        use reqwest_mock::HttpResponse;
-
+        headers: &[(HeaderName, HeaderValue)],
+    ) -> Result<fs::File, Error> {
         url.set_fragment(None);
 
         let mut response = match self.db.get(url.clone()) {
@@ -338,19 +342,21 @@ impl<C: reqwest_mock::Client> Cache<C> {
                 // We have a locally-cached copy, let's check whether the
                 // copy on the server has changed.
                 let mut request =
-                    reqwest::Request::new(reqwest::Method::GET, url.clone());
+                    Request::new(reqwest::Method::GET, url.clone());
                 if let Some(timestamp) = lm {
                     request.headers_mut().append(
                         rh::IF_MODIFIED_SINCE,
-                        rh::HeaderValue::from_str(&timestamp)?,
+                        HeaderValue::from_str(&timestamp)?,
                     );
                 }
                 if let Some(etag) = et {
                     request.headers_mut().append(
                         rh::IF_NONE_MATCH,
-                        rh::HeaderValue::from_str(&etag)?,
+                        HeaderValue::from_str(&etag)?,
                     );
                 }
+
+                request.append_headers(headers)?;
 
                 info!("Sending HTTP request: {:?}", request);
 
@@ -382,17 +388,14 @@ impl<C: reqwest_mock::Client> Cache<C> {
             }
             Err(_) => {
                 // This URL isn't in the cache, or we otherwise can't find it.
-                self.client
-                    .execute(reqwest::Request::new(
-                        reqwest::Method::GET,
-                        url.clone(),
-                    ))?
-                    .error_for_status()?
+                let mut request =
+                    Request::new(reqwest::Method::GET, url.clone());
+                request.append_headers(headers)?;
+                self.client.execute(request)?.error_for_status()?
             }
         };
 
-        let (mut handle, path, trans) =
-            self.record_response(url.clone(), &response)?;
+        let (mut handle, path, trans) = self.record_response(url, &response)?;
 
         let count = io::copy(&mut response, &mut handle)?;
 
@@ -404,19 +407,38 @@ impl<C: reqwest_mock::Client> Cache<C> {
     }
 }
 
+trait RequestExt {
+    fn append_headers(
+        &mut self,
+        headers: &[(HeaderName, HeaderValue)],
+    ) -> Result<(), Error>;
+}
+
+impl RequestExt for Request {
+    fn append_headers(
+        &mut self,
+        headers: &[(HeaderName, HeaderValue)],
+    ) -> Result<(), Error> {
+        for (n, v) in headers.iter() {
+            if n == rh::IF_MODIFIED_SINCE || n == rh::IF_NONE_MATCH {
+                return Err(Error::DuplicateHeader(n.clone()));
+            }
+            self.headers_mut().append(n, v.clone());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate env_logger;
     extern crate tempdir;
 
-    use reqwest;
-    use reqwest::header as rh;
-
     use std::io;
-
     use std::io::Read;
 
     use super::reqwest_mock::tests as rmt;
+    use super::*;
 
     const DATE_ZERO: &str = "Thu, 01 Jan 1970 00:00:00 GMT";
     const DATE_ONE: &str = "Thu, 01 Jan 1970 00:00:00 GMT";
@@ -444,10 +466,10 @@ mod tests {
 
         let mut c = make_test_cache(rmt::FakeClient::new(
             url.clone(),
-            rh::HeaderMap::new(),
+            HeaderMap::new(),
             rmt::FakeResponse {
                 status: reqwest::StatusCode::OK,
-                headers: rh::HeaderMap::new(),
+                headers: HeaderMap::new(),
                 body: io::Cursor::new(body.as_ref().into()),
             },
         ));
@@ -467,16 +489,16 @@ mod tests {
         let url: reqwest::Url = "http://example.com/".parse().unwrap();
         let mut c = make_test_cache(rmt::FakeClient::new(
             url.clone(),
-            rh::HeaderMap::new(),
+            HeaderMap::new(),
             rmt::FakeResponse {
                 status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                headers: rh::HeaderMap::new(),
+                headers: HeaderMap::new(),
                 body: io::Cursor::new(vec![]),
             },
         ));
 
         let err = c.get(url).expect_err("Got a response??");
-        assert_eq!(format!("{}", err), "FakeError");
+        assert_eq!(format!("{}", err), "fake error");
         c.client.assert_called();
     }
 
@@ -493,10 +515,10 @@ mod tests {
         let mut c = make_test_cache(rmt::FakeClient::new(
             // We expect the cache to request the URL without the fragment.
             network_url,
-            rh::HeaderMap::new(),
+            HeaderMap::new(),
             rmt::FakeResponse {
                 status: reqwest::StatusCode::OK,
-                headers: rh::HeaderMap::new(),
+                headers: HeaderMap::new(),
                 body: io::Cursor::new(b"hello world"[..].into()),
             },
         ));
@@ -514,13 +536,13 @@ mod tests {
 
         // We send a request, and the server responds with the data,
         // and a "Last-Modified" header.
-        let mut response_headers = rh::HeaderMap::new();
+        let mut response_headers = HeaderMap::new();
         response_headers
-            .append(rh::LAST_MODIFIED, rh::HeaderValue::from_static(DATE_ZERO));
+            .append(rh::LAST_MODIFIED, HeaderValue::from_static(DATE_ZERO));
 
         let mut c = make_test_cache(rmt::FakeClient::new(
             url.clone(),
-            rh::HeaderMap::new(),
+            HeaderMap::new(),
             rmt::FakeResponse {
                 status: reqwest::StatusCode::OK,
                 headers: response_headers.clone(),
@@ -536,11 +558,9 @@ mod tests {
         // For the next request, we expect the request to include the
         // modified date in the "if modified since" header, and we'll give
         // the "no, it hasn't been modified" response.
-        let mut second_request = rh::HeaderMap::new();
-        second_request.append(
-            rh::IF_MODIFIED_SINCE,
-            rh::HeaderValue::from_static(DATE_ZERO),
-        );
+        let mut second_request = HeaderMap::new();
+        second_request
+            .append(rh::IF_MODIFIED_SINCE, HeaderValue::from_static(DATE_ZERO));
 
         c.client = rmt::FakeClient::new(
             url.clone(),
@@ -570,10 +590,10 @@ mod tests {
 
         // We send a request, and the server responds with the data,
         // and a "Last-Modified" header.
-        let request_1_headers = rh::HeaderMap::new();
-        let mut response_1_headers = rh::HeaderMap::new();
+        let request_1_headers = HeaderMap::new();
+        let mut response_1_headers = HeaderMap::new();
         response_1_headers
-            .append(rh::LAST_MODIFIED, rh::HeaderValue::from_static(DATE_ZERO));
+            .append(rh::LAST_MODIFIED, HeaderValue::from_static(DATE_ZERO));
 
         let mut c = make_test_cache(rmt::FakeClient::new(
             url.clone(),
@@ -593,14 +613,12 @@ mod tests {
         // For the next request, we expect the request to include the
         // modified date in the "if modified since" header, and we'll give
         // the "yes, it has been modified" response with a new Last-Modified.
-        let mut request_2_headers = rh::HeaderMap::new();
-        request_2_headers.append(
-            rh::IF_MODIFIED_SINCE,
-            rh::HeaderValue::from_static(DATE_ZERO),
-        );
-        let mut response_2_headers = rh::HeaderMap::new();
+        let mut request_2_headers = HeaderMap::new();
+        request_2_headers
+            .append(rh::IF_MODIFIED_SINCE, HeaderValue::from_static(DATE_ZERO));
+        let mut response_2_headers = HeaderMap::new();
         response_2_headers
-            .append(rh::LAST_MODIFIED, rh::HeaderValue::from_static(DATE_ONE));
+            .append(rh::LAST_MODIFIED, HeaderValue::from_static(DATE_ONE));
 
         c.client = rmt::FakeClient::new(
             url.clone(),
@@ -623,12 +641,10 @@ mod tests {
         // If we make another request, we should set If-Modified-Since
         // to match the second response, and be able to return the data from
         // the second response.
-        let mut request_3_headers = rh::HeaderMap::new();
-        request_3_headers.append(
-            rh::IF_MODIFIED_SINCE,
-            rh::HeaderValue::from_static(DATE_ONE),
-        );
-        let response_3_headers = rh::HeaderMap::new();
+        let mut request_3_headers = HeaderMap::new();
+        request_3_headers
+            .append(rh::IF_MODIFIED_SINCE, HeaderValue::from_static(DATE_ONE));
+        let response_3_headers = HeaderMap::new();
 
         c.client = rmt::FakeClient::new(
             url.clone(),
@@ -661,10 +677,10 @@ mod tests {
 
         // We send a request, and the server responds with the data,
         // and a "Last-Modified" header.
-        let request_1_headers = rh::HeaderMap::new();
-        let mut response_1_headers = rh::HeaderMap::new();
+        let request_1_headers = HeaderMap::new();
+        let mut response_1_headers = HeaderMap::new();
         response_1_headers
-            .append(rh::LAST_MODIFIED, rh::HeaderValue::from_static(DATE_ZERO));
+            .append(rh::LAST_MODIFIED, HeaderValue::from_static(DATE_ZERO));
 
         let mut c = super::Cache::new(
             temp_path.clone(),
@@ -687,15 +703,13 @@ mod tests {
 
         // If we make second request, we should set If-Modified-Since
         // to match the first response's Last-Modified.
-        let mut request_2_headers = rh::HeaderMap::new();
-        request_2_headers.append(
-            rh::IF_MODIFIED_SINCE,
-            rh::HeaderValue::from_static(DATE_ZERO),
-        );
+        let mut request_2_headers = HeaderMap::new();
+        request_2_headers
+            .append(rh::IF_MODIFIED_SINCE, HeaderValue::from_static(DATE_ZERO));
 
         // This time, however, the request will return an error.
         let mut c = super::Cache::new(
-            temp_path.clone(),
+            temp_path,
             rmt::BrokenClient::new(url.clone(), request_2_headers, || {
                 rmt::FakeError.into()
             }),
@@ -703,7 +717,7 @@ mod tests {
         .unwrap();
 
         // Now when we request a URL, we should get the cached result.
-        let mut res = c.get(url.clone()).unwrap();
+        let mut res = c.get(url).unwrap();
         let mut buf = vec![];
         res.read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, b"hello");
@@ -719,12 +733,12 @@ mod tests {
 
         // We send a request, and the server responds with the data,
         // and an "Etag" header.
-        let mut response_headers = rh::HeaderMap::new();
-        response_headers.append(rh::ETAG, rh::HeaderValue::from_static("abcd"));
+        let mut response_headers = HeaderMap::new();
+        response_headers.append(rh::ETAG, HeaderValue::from_static("abcd"));
 
         let mut c = make_test_cache(rmt::FakeClient::new(
             url.clone(),
-            rh::HeaderMap::new(),
+            HeaderMap::new(),
             rmt::FakeResponse {
                 status: reqwest::StatusCode::OK,
                 headers: response_headers.clone(),
@@ -740,9 +754,9 @@ mod tests {
         // For the next request, we expect the request to include the
         // etag in the "if none match" header, and we'll give
         // the "no, it hasn't been modified" response.
-        let mut second_request = rh::HeaderMap::new();
+        let mut second_request = HeaderMap::new();
         second_request
-            .append(rh::IF_NONE_MATCH, rh::HeaderValue::from_static("abcd"));
+            .append(rh::IF_NONE_MATCH, HeaderValue::from_static("abcd"));
 
         c.client = rmt::FakeClient::new(
             url.clone(),
@@ -772,10 +786,9 @@ mod tests {
 
         // We send a request, and the server responds with the data,
         // and an "ETag" header.
-        let request_1_headers = rh::HeaderMap::new();
-        let mut response_1_headers = rh::HeaderMap::new();
-        response_1_headers
-            .append(rh::ETAG, rh::HeaderValue::from_static("abcd"));
+        let request_1_headers = HeaderMap::new();
+        let mut response_1_headers = HeaderMap::new();
+        response_1_headers.append(rh::ETAG, HeaderValue::from_static("abcd"));
 
         let mut c = make_test_cache(rmt::FakeClient::new(
             url.clone(),
@@ -794,12 +807,11 @@ mod tests {
         // For the next request, we expect the request to include the
         // etag in the "if none match" header, and we'll give
         // the "yes, it has been modified" response with a new etag.
-        let mut request_2_headers = rh::HeaderMap::new();
+        let mut request_2_headers = HeaderMap::new();
         request_2_headers
-            .append(rh::IF_NONE_MATCH, rh::HeaderValue::from_static("abcd"));
-        let mut response_2_headers = rh::HeaderMap::new();
-        response_2_headers
-            .append(rh::ETAG, rh::HeaderValue::from_static("efgh"));
+            .append(rh::IF_NONE_MATCH, HeaderValue::from_static("abcd"));
+        let mut response_2_headers = HeaderMap::new();
+        response_2_headers.append(rh::ETAG, HeaderValue::from_static("efgh"));
 
         c.client = rmt::FakeClient::new(
             url.clone(),
@@ -822,10 +834,10 @@ mod tests {
         // If we make another request, we should set If-None-Match
         // to match the second response, and be able to return the data from
         // the second response.
-        let mut request_3_headers = rh::HeaderMap::new();
+        let mut request_3_headers = HeaderMap::new();
         request_3_headers
-            .append(rh::IF_NONE_MATCH, rh::HeaderValue::from_static("efgh"));
-        let response_3_headers = rh::HeaderMap::new();
+            .append(rh::IF_NONE_MATCH, HeaderValue::from_static("efgh"));
+        let response_3_headers = HeaderMap::new();
 
         c.client = rmt::FakeClient::new(
             url.clone(),

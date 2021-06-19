@@ -3,37 +3,39 @@
 //!
 //! You do not need to care about this module
 //! if you just want to use this crate.
-use std::error;
 use std::fmt;
 use std::io;
 
-use reqwest;
+use reqwest::blocking::Request;
+use reqwest::StatusCode;
+
+use crate::error::Error;
 
 /// Represents the result of sending an HTTP request.
 ///
 /// Modelled after `reqwest::Response`.
 pub trait HttpResponse: io::Read + fmt::Debug
 where
-    Self: ::std::marker::Sized,
+    Self: Sized,
 {
     /// Obtain access to the headers of the response.
     fn headers(&self) -> &reqwest::header::HeaderMap;
 
     /// Obtain a copy of the response's status.
-    fn status(&self) -> reqwest::StatusCode;
+    fn status(&self) -> StatusCode;
 
     /// Return an error if the response's status is in the range 400-599.
-    fn error_for_status(self) -> Result<Self, Box<error::Error>>;
+    fn error_for_status(self) -> Result<Self, Error>;
 }
 
-impl HttpResponse for reqwest::Response {
+impl HttpResponse for reqwest::blocking::Response {
     fn headers(&self) -> &reqwest::header::HeaderMap {
         self.headers()
     }
-    fn status(&self) -> reqwest::StatusCode {
+    fn status(&self) -> StatusCode {
         self.status()
     }
-    fn error_for_status(self) -> Result<Self, Box<error::Error>> {
+    fn error_for_status(self) -> Result<Self, Error> {
         Ok(self.error_for_status()?)
     }
 }
@@ -46,59 +48,48 @@ pub trait Client {
     type Response: HttpResponse;
 
     /// Send the given request and return the response (or an error).
-    fn execute(
-        &self,
-        request: reqwest::Request,
-    ) -> Result<Self::Response, Box<error::Error>>;
+    fn execute(&self, request: Request) -> Result<Self::Response, Error>;
 }
 
-impl Client for reqwest::Client {
-    type Response = reqwest::Response;
+impl Client for reqwest::blocking::Client {
+    type Response = reqwest::blocking::Response;
 
-    fn execute(
-        &self,
-        request: reqwest::Request,
-    ) -> Result<Self::Response, Box<error::Error>> {
+    fn execute(&self, request: Request) -> Result<Self::Response, Error> {
         Ok(self.execute(request)?)
     }
 }
 
 #[cfg(test)]
 pub mod tests {
-    use reqwest;
-
     use std::cell;
     use std::fmt;
     use std::io;
-
-    use std::error::Error;
     use std::io::Read;
+
+    use super::*;
 
     #[derive(Debug, Eq, PartialEq, Hash)]
     pub struct FakeError;
 
     impl fmt::Display for FakeError {
-        fn fmt(
-            &self,
-            f: &mut ::std::fmt::Formatter,
-        ) -> Result<(), ::std::fmt::Error> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
             f.write_str("FakeError")?;
             Ok(())
         }
     }
 
-    impl Error for FakeError {
+    impl std::error::Error for FakeError {
         fn description(&self) -> &str {
             "Something Ooo occurred"
         }
-        fn cause(&self) -> Option<&Error> {
+        fn cause(&self) -> Option<&dyn std::error::Error> {
             None
         }
     }
 
     #[derive(Clone, Debug)]
     pub struct FakeResponse {
-        pub status: reqwest::StatusCode,
+        pub status: StatusCode,
         pub headers: reqwest::header::HeaderMap,
         pub body: io::Cursor<Vec<u8>>,
     }
@@ -107,15 +98,15 @@ pub mod tests {
         fn headers(&self) -> &reqwest::header::HeaderMap {
             &self.headers
         }
-        fn status(&self) -> reqwest::StatusCode {
+        fn status(&self) -> StatusCode {
             self.status
         }
-        fn error_for_status(self) -> Result<Self, Box<Error>> {
+        fn error_for_status(self) -> Result<Self, Error> {
             if !self.status.is_client_error() && !self.status.is_server_error()
             {
                 Ok(self)
             } else {
-                Err(Box::new(FakeError))
+                Err(FakeError.into())
             }
         }
     }
@@ -149,17 +140,14 @@ pub mod tests {
         }
 
         pub fn assert_called(self) {
-            assert_eq!(self.called.get(), true);
+            assert!(self.called.get());
         }
     }
 
     impl super::Client for FakeClient {
         type Response = FakeResponse;
 
-        fn execute(
-            &self,
-            request: reqwest::Request,
-        ) -> Result<Self::Response, Box<Error>> {
+        fn execute(&self, request: Request) -> Result<Self::Response, Error> {
             assert_eq!(request.method(), &reqwest::Method::GET);
             assert_eq!(request.url(), &self.expected_url);
             assert_eq!(request.headers(), &self.expected_headers);
@@ -172,7 +160,7 @@ pub mod tests {
 
     pub struct BrokenClient<F>
     where
-        F: Fn() -> Box<Error>,
+        F: Fn() -> Error,
     {
         pub expected_url: reqwest::Url,
         pub expected_headers: reqwest::header::HeaderMap,
@@ -182,7 +170,7 @@ pub mod tests {
 
     impl<F> BrokenClient<F>
     where
-        F: Fn() -> Box<Error>,
+        F: Fn() -> Error,
     {
         pub fn new(
             expected_url: reqwest::Url,
@@ -199,20 +187,17 @@ pub mod tests {
         }
 
         pub fn assert_called(self) {
-            assert_eq!(self.called.get(), true);
+            assert!(self.called.get());
         }
     }
 
     impl<F> super::Client for BrokenClient<F>
     where
-        F: Fn() -> Box<Error>,
+        F: Fn() -> Error,
     {
         type Response = FakeResponse;
 
-        fn execute(
-            &self,
-            request: reqwest::Request,
-        ) -> Result<Self::Response, Box<Error>> {
+        fn execute(&self, request: Request) -> Result<Self::Response, Error> {
             assert_eq!(request.method(), &reqwest::Method::GET);
             assert_eq!(request.url(), &self.expected_url);
             assert_eq!(request.headers(), &self.expected_headers);
@@ -222,5 +207,4 @@ pub mod tests {
             Err((self.make_error)())
         }
     }
-
 }

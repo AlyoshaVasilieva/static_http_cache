@@ -5,6 +5,13 @@
   - [Package](https://crates.io/crates/static-http-cache)
   - [Source code](https://gitlab.com/Screwtapello/static_http_cache)
 
+Note
+----
+
+I've updated this to Reqwest 0.11, using the blocking API, with better
+error modeling. I don't intend to publish this on crates.io or
+complete the rest of the TODO below.
+
 TODO
 ----
 
