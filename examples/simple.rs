@@ -1,21 +1,17 @@
-extern crate static_http_cache;
 extern crate reqwest;
+extern crate static_http_cache;
 
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
 
-
-fn get_resource() -> Result<fs::File, Box<Error>>
-{
+fn get_resource() -> Result<fs::File, Box<dyn Error>> {
     // Where shall we store our cache data?
     let cache_path = env::temp_dir().join("static_http_cache");
 
     // Create the directory to hold persistent cache data.
-    fs::DirBuilder::new()
-        .recursive(true)
-        .create(&cache_path)?;
+    fs::DirBuilder::new().recursive(true).create(&cache_path)?;
 
     // What URL should we download?
     let url = reqwest::Url::parse(
@@ -25,13 +21,12 @@ fn get_resource() -> Result<fs::File, Box<Error>>
     // Create the cache data structure we need on disk.
     let mut cache = static_http_cache::Cache::new(
         cache_path,
-        reqwest::Client::new(),
+        reqwest::blocking::Client::new(),
     )?;
 
     // Actually retrieve the URL if needed.
-    cache.get(url)
+    Ok(cache.get(url)?)
 }
-
 
 fn main() {
     let mut file = get_resource().expect("Could not download URL");

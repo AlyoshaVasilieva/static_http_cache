@@ -1,12 +1,12 @@
 use std::cmp;
-use std::error;
 use std::ffi;
 use std::fmt;
 use std::iter;
 use std::path;
 
-use reqwest;
-use sqlite;
+use sqlite::Value;
+
+use crate::error::Error;
 
 const SCHEMA_SQL: &str = "
     CREATE TABLE urls (
@@ -32,7 +32,7 @@ pub struct CacheRecord {
 struct Rows<'a>(sqlite::Cursor<'a>);
 
 impl<'a> iter::Iterator for Rows<'a> {
-    type Item = Vec<sqlite::Value>;
+    type Item = Vec<Value>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0
@@ -55,12 +55,12 @@ pub struct Transaction<'a> {
 impl<'a> Transaction<'a> {
     fn new(conn: &'a sqlite::Connection) -> Transaction<'a> {
         Transaction {
-            conn: conn,
+            conn,
             committed: false,
         }
     }
 
-    pub fn commit(mut self) -> Result<(), Box<error::Error>> {
+    pub fn commit(mut self) -> Result<(), Error> {
         debug!("Attempting to commit changes...");
         self.committed = true;
 
@@ -95,23 +95,21 @@ impl<'a> Drop for Transaction<'a> {
     }
 }
 
-fn canonicalize_db_path(
-    path: path::PathBuf,
-) -> Result<path::PathBuf, Box<error::Error>> {
+fn canonicalize_db_path(path: path::PathBuf) -> Result<path::PathBuf, Error> {
     let mem_path: ffi::OsString = ":memory:".into();
 
     Ok(if path == mem_path {
         // If it's the special ":memory:" path, use it as-is.
-        path.to_path_buf()
+        path
     } else {
-        let parent = path.parent().unwrap_or(path::Path::new("."));
+        let parent = path.parent().unwrap_or_else(|| path::Path::new("."));
 
         // Otherwise, canonicalize it so we can reliably compare instances.
         // The weird joining behaviour is because we require the path
         // to exist, but we don't require the filename to exist.
         parent
             .canonicalize()?
-            .join(path.file_name().unwrap_or(ffi::OsStr::new("")))
+            .join(path.file_name().unwrap_or_else(|| ffi::OsStr::new("")))
     })
 }
 
@@ -123,7 +121,7 @@ pub struct CacheDB {
 
 impl CacheDB {
     /// Create a cache database in the given file.
-    pub fn new(path: path::PathBuf) -> Result<CacheDB, Box<error::Error>> {
+    pub fn new(path: path::PathBuf) -> Result<CacheDB, Error> {
         let path = canonicalize_db_path(path)?;
         debug!("Creating cache metadata in {:?}", path);
         let conn = sqlite::Connection::open(&path)?;
@@ -135,7 +133,7 @@ impl CacheDB {
         let rows: Vec<_> = res
             .query("SELECT COUNT(*) FROM sqlite_master;", &[])?
             .collect();
-        if let sqlite::Value::Integer(0) = rows[0][0] {
+        if let Value::Integer(0) = rows[0][0] {
             debug!("No tables in the cache DB, loading schema.");
             res.conn.execute(SCHEMA_SQL)?
         }
@@ -146,24 +144,21 @@ impl CacheDB {
     fn query<'a, T: AsRef<str>>(
         &'a self,
         query: T,
-        params: &[sqlite::Value],
+        params: &[Value],
     ) -> sqlite::Result<Rows>
     where
         T: ::std::fmt::Debug,
     {
         debug!("Executing query: {:?} with values {:?}", query, params);
 
-        let mut cur = self.conn.prepare(query)?.cursor();
+        let mut cur = self.conn.prepare(query)?.into_cursor();
         cur.bind(params)?;
 
         Ok(Rows(cur))
     }
 
     /// Return what the DB knows about a URL, if anything.
-    pub fn get(
-        &self,
-        mut url: reqwest::Url,
-    ) -> Result<CacheRecord, Box<error::Error>> {
+    pub fn get(&self, mut url: reqwest::Url) -> Result<CacheRecord, Error> {
         url.set_fragment(None);
 
         let mut rows = self.query(
@@ -172,25 +167,25 @@ impl CacheDB {
             FROM urls
             WHERE url = ?1
             ",
-            &[sqlite::Value::String(url.as_str().into())],
+            &[Value::String(url.as_str().into())],
         )?;
 
         rows.next()
-            .map_or(
-                Err(format!("URL not found in cache: {:?}", url)),
-                |x| Ok(x),
+            .map_or_else(
+                || Err(Error::URLNotFound(url.clone())),
+                Ok,
             )
-            .map(|row| -> Result<CacheRecord, Box<error::Error>> {
+            .map(|row: Vec<Value>| -> Result<CacheRecord, Error> {
                 let mut cols = row.into_iter();
 
                 let path = match cols.next().unwrap() {
-                    sqlite::Value::String(s) => Ok(s),
-                    other => Err(format!("Path had wrong type: {:?}", other)),
+                    Value::String(s) => Ok(s),
+                    other => Err(Error::WrongPathType(format!("{:?}", other))),
                 }?;
 
                 let last_modified = match cols.next().unwrap() {
-                    sqlite::Value::String(s) => Some(s),
-                    sqlite::Value::Null => None,
+                    Value::String(s) => Some(s),
+                    Value::Null => None,
                     other => {
                         warn!(
                             "last_modified contained weird type: {:?}",
@@ -201,8 +196,8 @@ impl CacheDB {
                 };
 
                 let etag = match cols.next().unwrap() {
-                    sqlite::Value::String(s) => Some(s),
-                    sqlite::Value::Null => None,
+                    Value::String(s) => Some(s),
+                    Value::Null => None,
                     other => {
                         warn!("etag contained weird type: {:?}", other);
                         None
@@ -220,7 +215,7 @@ impl CacheDB {
         &mut self,
         mut url: reqwest::Url,
         record: CacheRecord,
-    ) -> Result<Transaction, Box<error::Error>> {
+    ) -> Result<Transaction, Error> {
         url.set_fragment(None);
 
         // TODO: Consider using the "pre-poop-your-pants" pattern to
@@ -242,16 +237,13 @@ impl CacheDB {
                 (?1, ?2, ?3, ?4);
             ",
             &[
-                sqlite::Value::String(url.as_str().into()),
-                sqlite::Value::String(record.path),
+                Value::String(url.as_str().into()),
+                Value::String(record.path),
                 record
                     .last_modified
-                    .map(|date| sqlite::Value::String(date))
-                    .unwrap_or(sqlite::Value::Null),
-                record
-                    .etag
-                    .map(|etag| sqlite::Value::String(etag))
-                    .unwrap_or(sqlite::Value::Null),
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+                record.etag.map(Value::String).unwrap_or(Value::Null),
             ],
         )?;
 
@@ -278,11 +270,11 @@ impl cmp::Eq for CacheDB {}
 
 #[cfg(test)]
 mod tests {
-    extern crate tempdir;
-    use reqwest;
-    use sqlite;
-
     use std::path;
+
+    use super::*;
+
+    extern crate tempdir;
 
     #[test]
     fn create_fresh_db() {
@@ -292,12 +284,12 @@ mod tests {
         let rows: Vec<_> = db
             .query(
                 "SELECT name FROM sqlite_master WHERE TYPE = ?1",
-                &[sqlite::Value::String("table".into())],
+                &[Value::String("table".into())],
             )
             .unwrap()
             .collect();
 
-        assert_eq!(rows, vec![vec![sqlite::Value::String("urls".into())]]);
+        assert_eq!(rows, vec![vec![Value::String("urls".into())]]);
     }
 
     #[test]
@@ -309,21 +301,21 @@ mod tests {
         let rows: Vec<_> = db1
             .query(
                 "SELECT name FROM sqlite_master WHERE TYPE = ?1",
-                &[sqlite::Value::String("table".into())],
+                &[Value::String("table".into())],
             )
             .unwrap()
             .collect();
-        assert_eq!(rows, vec![vec![sqlite::Value::String("urls".into())]]);
+        assert_eq!(rows, vec![vec![Value::String("urls".into())]]);
 
-        let db2 = super::CacheDB::new(db_path.clone()).unwrap();
+        let db2 = super::CacheDB::new(db_path).unwrap();
         let rows: Vec<_> = db2
             .query(
                 "SELECT name FROM sqlite_master WHERE TYPE = ?1",
-                &[sqlite::Value::String("table".into())],
+                &[Value::String("table".into())],
             )
             .unwrap()
             .collect();
-        assert_eq!(rows, vec![vec![sqlite::Value::String("urls".into())]]);
+        assert_eq!(rows, vec![vec![Value::String("urls".into())]]);
     }
 
     #[test]
@@ -331,7 +323,7 @@ mod tests {
         let res =
             super::CacheDB::new(path::PathBuf::new().join("does/not/exist"));
 
-        assert_eq!(res.is_err(), true);
+        assert!(res.is_err());
     }
 
     #[test]
@@ -342,8 +334,11 @@ mod tests {
         let err = db.get("http://example.com/".parse().unwrap()).unwrap_err();
 
         assert_eq!(
-            err.description(),
-            "URL not found in cache: \"http://example.com/\""
+            err.to_string(),
+            format!(
+                "URL not found in cache: {:?}",
+                reqwest::Url::parse("http://example.com/").unwrap()
+            )
         );
     }
 
@@ -369,8 +364,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            err.description(),
-            "URL not found in cache: \"http://example.com/two\""
+            err.to_string(),
+            format!(
+                "URL not found in cache: {:?}",
+                reqwest::Url::parse("http://example.com/two").unwrap()
+            )
         );
     }
 
@@ -446,8 +444,8 @@ mod tests {
         let err = db.get("http://example.com/".parse().unwrap()).unwrap_err();
 
         assert_eq!(
-            err.description(),
-            "Path had wrong type: Binary([97, 98, 99])"
+            err.to_string(),
+            "path had wrong type: Binary([97, 98, 99])"
         );
     }
 
@@ -578,15 +576,15 @@ mod tests {
         // Add data into the DB, inside a block so we can be sure all the
         //  intermediates have been dropped afterward.
         {
-            let _ = db.set(url.clone(), record.clone()).unwrap();
+            let _ = db.set(url.clone(), record).unwrap();
 
             // Don't commit before the end of the block!
         }
 
         // Did our data make it into the DB?
         assert_eq!(
-            db.get(url).unwrap_err().description(),
-            "URL not found in cache: \"http://example.com/\""
+            db.get(url.clone()).unwrap_err().to_string(),
+            format!("URL not found in cache: {:?}", url)
         );
     }
 
@@ -625,7 +623,7 @@ mod tests {
             .unwrap();
 
         // We recorded that correctly too, right?
-        assert_eq!(db.get(url.clone()).unwrap(), record_two);
+        assert_eq!(db.get(url).unwrap(), record_two);
     }
 
     #[test]
@@ -705,7 +703,7 @@ mod tests {
         let db_path = root.join("cache.db");
 
         let db1 = super::CacheDB::new(db_path.clone()).unwrap();
-        let db2 = super::CacheDB::new(db_path.clone()).unwrap();
+        let db2 = super::CacheDB::new(db_path).unwrap();
 
         assert_eq!(db1, db2);
     }
