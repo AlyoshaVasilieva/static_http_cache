@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://docs.rs/static_http_cache/0.3.0")]
+#![doc(html_root_url = "https://docs.rs/static_http_cache/0.4.0")]
 //! Introduction
 //! ============
 //!
@@ -113,6 +113,9 @@ use reqwest::StatusCode;
 use reqwest_mock::HttpResponse;
 
 pub use crate::error::Error;
+use httpdate::HttpDate;
+use std::str::FromStr;
+use std::time::SystemTime;
 
 pub mod reqwest_mock;
 
@@ -254,12 +257,15 @@ impl<C: reqwest_mock::Client> Cache<C> {
 
             let etag = header_as_string(response.headers(), &rh::ETAG);
 
+            let expires = header_as_string(response.headers(), &rh::EXPIRES);
+
             self.db.set(
                 url,
                 db::CacheRecord {
                     path,
                     last_modified,
                     etag,
+                    expires,
                 },
             )?
         };
@@ -338,9 +344,21 @@ impl<C: reqwest_mock::Client> Cache<C> {
                 path: p,
                 last_modified: lm,
                 etag: et,
+                expires: ex,
             }) => {
-                // We have a locally-cached copy, let's check whether the
-                // copy on the server has changed.
+                // We have a locally-cached copy, if possible check if it's
+                // fresh and immediately return.
+                if let Some(expires) =
+                    ex.map(|e| HttpDate::from_str(&e).ok()).flatten()
+                {
+                    let now = HttpDate::from(SystemTime::now());
+                    if now < expires {
+                        // file should be fresh
+                        return Ok(fs::File::open(self.root.join(p))?);
+                    }
+                }
+                // Let's check whether the copy on the server has changed.
+
                 let mut request =
                     Request::new(reqwest::Method::GET, url.clone());
                 if let Some(timestamp) = lm {

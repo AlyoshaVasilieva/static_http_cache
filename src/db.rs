@@ -10,10 +10,11 @@ use crate::error::Error;
 
 const SCHEMA_SQL: &str = "
     CREATE TABLE urls (
-    	url TEXT NOT NULL UNIQUE,
-    	path TEXT NOT NULL,
-    	last_modified TEXT,
-    	etag TEXT
+        url TEXT NOT NULL UNIQUE,
+        path TEXT NOT NULL,
+        last_modified TEXT,
+        etag TEXT,
+        expires TEXT
     );
 ";
 
@@ -26,6 +27,8 @@ pub struct CacheRecord {
     pub last_modified: Option<String>,
     /// The value of the Etag header in the original response.
     pub etag: Option<String>,
+    /// The value of the Expires header in the original response.
+    pub expires: Option<String>,
 }
 
 /// Represents the rows returned by a query.
@@ -163,7 +166,7 @@ impl CacheDB {
 
         let mut rows = self.query(
             "
-            SELECT path, last_modified, etag
+            SELECT path, last_modified, etag, expires
             FROM urls
             WHERE url = ?1
             ",
@@ -204,9 +207,18 @@ impl CacheDB {
                     },
                 };
 
+                let expires = match cols.next().unwrap() {
+                    Value::String(s) => Some(s),
+                    Value::Null => None,
+                    other => {
+                        warn!("expires contained weird type: {:?}", other);
+                        None
+                    },
+                };
+
                 debug!("Cache says URL {:?} content is at {:?}, etag {:?}, last modified at {:?}", url, path, etag, last_modified);
 
-                Ok(CacheRecord{path, last_modified, etag})
+                Ok(CacheRecord{path, last_modified, etag, expires})
             })?
     }
 
@@ -232,9 +244,9 @@ impl CacheDB {
         let rows = self.query(
             "
             INSERT OR REPLACE INTO urls
-                (url, path, last_modified, etag)
+                (url, path, last_modified, etag, expires)
             VALUES
-                (?1, ?2, ?3, ?4);
+                (?1, ?2, ?3, ?4, ?5);
             ",
             &[
                 Value::String(url.as_str().into()),
@@ -244,6 +256,7 @@ impl CacheDB {
                     .map(Value::String)
                     .unwrap_or(Value::Null),
                 record.etag.map(Value::String).unwrap_or(Value::Null),
+                record.expires.map(Value::String).unwrap_or(Value::Null),
             ],
         )?;
 
@@ -353,6 +366,7 @@ mod tests {
                 path: "path/to/data".into(),
                 last_modified: None,
                 etag: None,
+                expires: None,
             },
         )
         .unwrap()
@@ -381,6 +395,7 @@ mod tests {
             path: "path/to/data".into(),
             last_modified: None,
             etag: None,
+            expires: None,
         };
 
         db.set("http://example.com/".parse().unwrap(), orig_record.clone())
@@ -403,6 +418,7 @@ mod tests {
             path: "path/to/data".into(),
             last_modified: Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
             etag: Some("some-etag".into()),
+            expires: None,
         };
 
         db.set("http://example.com/".parse().unwrap(), orig_record.clone())
@@ -429,10 +445,12 @@ mod tests {
                 , path
                 , last_modified
                 , etag
+                , expires
                 )
             VALUES
                 ( 'http://example.com/'
                 , CAST('abc' AS BLOB)
+                , NULL
                 , NULL
                 , NULL
                 )
@@ -462,12 +480,14 @@ mod tests {
                 , path
                 , last_modified
                 , etag
+                , expires
                 )
             VALUES
                 ( 'http://example.com/'
                 , 'path/to/data'
                 , CAST('abc' AS BLOB)
                 , CAST('def' AS BLOB)
+                , CAST('ghi' AS BLOB)
                 )
             ;
         ",
@@ -484,6 +504,7 @@ mod tests {
                 // treat it as NULL.
                 last_modified: None,
                 etag: None,
+                expires: None,
             }
         );
     }
@@ -497,6 +518,7 @@ mod tests {
             path: "path/to/data".into(),
             last_modified: None,
             etag: None,
+            expires: None,
         };
 
         db.set("http://example.com/".parse().unwrap(), orig_record.clone())
@@ -517,6 +539,7 @@ mod tests {
             path: "path/to/data".into(),
             last_modified: None,
             etag: None,
+            expires: None,
         };
 
         let mut db =
@@ -545,6 +568,7 @@ mod tests {
             path: "path/to/data".into(),
             last_modified: Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
             etag: Some("some-etag".into()),
+            expires: None,
         };
 
         let mut db =
@@ -568,6 +592,7 @@ mod tests {
             path: "path/to/data".into(),
             last_modified: None,
             etag: None,
+            expires: None,
         };
 
         let mut db =
@@ -596,12 +621,14 @@ mod tests {
             path: "path/to/data/one".into(),
             last_modified: None,
             etag: Some("one".into()),
+            expires: None,
         };
 
         let record_two = super::CacheRecord {
             path: "path/to/data/two".into(),
             last_modified: None,
             etag: Some("two".into()),
+            expires: None,
         };
 
         let mut db =
@@ -632,12 +659,14 @@ mod tests {
             path: "path/to/data/one".into(),
             last_modified: None,
             etag: Some("one".into()),
+            expires: None,
         };
 
         let record_two = super::CacheRecord {
             path: "path/to/data/two".into(),
             last_modified: None,
             etag: Some("two".into()),
+            expires: None,
         };
 
         let mut db =
